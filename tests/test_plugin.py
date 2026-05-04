@@ -159,9 +159,7 @@ async def test_search_with_cursor_sends_search_after() -> None:
     cursor = encode_cursor([1735732800000, 5], fp)
 
     plugin = LogzioPlugin()
-    await plugin.search(
-        _make_ctx(), _CREDS, _make_query(limit=1, cursor=cursor)
-    )
+    await plugin.search(ctx, _CREDS, _make_query(limit=1, cursor=cursor))
 
     req_body = json.loads(route.calls[0].request.content)  # type: ignore[union-attr]
     assert req_body['search_after'] == [1735732800000, 5]
