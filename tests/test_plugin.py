@@ -106,9 +106,7 @@ async def test_search_full_page_sets_next_cursor() -> None:
     respx.post('https://api.logz.io/v1/search').mock(
         return_value=httpx.Response(
             200,
-            json=_hits_response(
-                [_source_hit(sort=[1735732800000, 0])]
-            ),
+            json=_hits_response([_source_hit(sort=[1735732800000, 0])]),
         )
     )
     plugin = LogzioPlugin()
@@ -182,9 +180,7 @@ async def test_search_bad_cursor_token_raises() -> None:
 
 @respx.mock
 async def test_search_total_dict_format() -> None:
-    payload = {
-        'hits': {'total': {'value': 42, 'relation': 'eq'}, 'hits': []}
-    }
+    payload = {'hits': {'total': {'value': 42, 'relation': 'eq'}, 'hits': []}}
     respx.post('https://api.logz.io/v1/search').mock(
         return_value=httpx.Response(200, json=payload)
     )
