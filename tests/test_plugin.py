@@ -180,7 +180,9 @@ async def test_search_bad_cursor_token_raises() -> None:
 
 @respx.mock
 async def test_search_total_dict_format() -> None:
-    payload = {'hits': {'total': {'value': 42, 'relation': 'eq'}, 'hits': []}}
+    payload: dict[str, object] = {
+        'hits': {'total': {'value': 42, 'relation': 'eq'}, 'hits': []}
+    }
     respx.post('https://api.logz.io/v1/search').mock(
         return_value=httpx.Response(200, json=payload)
     )
@@ -191,7 +193,7 @@ async def test_search_total_dict_format() -> None:
 
 @respx.mock
 async def test_search_total_int_format() -> None:
-    payload = {'hits': {'total': 99, 'hits': []}}
+    payload: dict[str, object] = {'hits': {'total': 99, 'hits': []}}
     respx.post('https://api.logz.io/v1/search').mock(
         return_value=httpx.Response(200, json=payload)
     )

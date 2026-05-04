@@ -43,7 +43,6 @@ class LogzioPlugin(LogsPlugin):
         name='Logz.io',
         description='Search Logz.io logs from the Imbi project logs tab.',
         plugin_type='logs',
-        auth_type='api_token',
         api_version=1,
         cacheable=False,
         options=[
