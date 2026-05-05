@@ -92,6 +92,27 @@ class LogzioPlugin(LogsPlugin):
                 default='level',
             ),
             PluginOption(
+                name='environment_field',
+                label='Environment Field',
+                type='string',
+                required=False,
+                description=(
+                    'Log field used to filter by environment. '
+                    'Leave blank to disable automatic environment filtering.'
+                ),
+            ),
+            PluginOption(
+                name='default_environments',
+                label='Default Environments',
+                type='string',
+                required=False,
+                description=(
+                    'Comma-separated list of environments pre-selected in the '
+                    'UI (e.g. "production,staging"). Leave blank to use the '
+                    "UI's own default."
+                ),
+            ),
+            PluginOption(
                 name='timeout_seconds',
                 label='Request Timeout',
                 type='integer',
@@ -124,6 +145,8 @@ class LogzioPlugin(LogsPlugin):
         level_field = str(opts.get('level_field', 'level'))
         raw_bq = opts.get('base_query')
         base_query_template = str(raw_bq) if raw_bq is not None else None
+        raw_ef = opts.get('environment_field')
+        environment_field = str(raw_ef) if raw_ef else None
 
         ctx_vars: dict[str, str | None] = {
             'project_slug': ctx.project_slug,
@@ -139,6 +162,8 @@ class LogzioPlugin(LogsPlugin):
             timestamp_field=timestamp_field,
             message_field=message_field,
             ctx_vars=ctx_vars,
+            environment_field=environment_field,
+            environment_value=ctx.environment,
         )
         fp = compute_fp(query_body)
 
@@ -228,6 +253,8 @@ class LogzioPlugin(LogsPlugin):
         message_field = str(opts.get('message_field', 'message'))
         raw_bq = opts.get('base_query')
         base_query_template = str(raw_bq) if raw_bq is not None else None
+        raw_ef = opts.get('environment_field')
+        environment_field = str(raw_ef) if raw_ef else None
 
         ctx_vars: dict[str, str | None] = {
             'environment': ctx.environment,
@@ -236,14 +263,21 @@ class LogzioPlugin(LogsPlugin):
             'project_slug': ctx.project_slug,
         }
 
-        body = build_histogram_body(
-            query,
-            base_query=base_query_template,
-            bucket_count=bucket_count,
-            ctx_vars=ctx_vars,
-            message_field=message_field,
-            timestamp_field=timestamp_field,
-        )
+        level_field = str(opts.get('level_field', 'level'))
+
+        def _body(level: str | None) -> dict[str, object]:
+            return build_histogram_body(
+                query,
+                base_query=base_query_template,
+                bucket_count=bucket_count,
+                ctx_vars=ctx_vars,
+                message_field=message_field,
+                timestamp_field=timestamp_field,
+                level_filter=level,
+                level_field=level_field,
+                environment_field=environment_field,
+                environment_value=ctx.environment,
+            )
 
         # Logz.io /v1/search only searches a 2-calendar-day (UTC) window per
         # request.  dayOffset=N shifts the window so that day N and day N+1
@@ -254,40 +288,29 @@ class LogzioPlugin(LogsPlugin):
         start_offset = max(0, (today - query.start_time.date()).days)
         day_offsets = list(range(end_offset, start_offset + 2, 2))
 
-        responses = await asyncio.gather(
-            *[
-                post_search(
+        # Fan out: one total query + one per level per day offset.
+        level_names = ['ERROR', 'WARN', 'WARNING', 'INFO', 'DEBUG']
+        labels: list[str | None] = []
+        coros = []
+        for lvl in [None, *level_names]:
+            body = _body(lvl)
+            for offset in day_offsets:
+                labels.append(lvl)
+                coros.append(post_search(
                     api_token=api_token,
                     body=body,
                     day_offset=offset,
                     region=region,
                     timeout=timeout,
                     version=_VERSION,
-                )
-                for offset in day_offsets
-            ],
-            return_exceptions=True,
+                ))
+
+        raw_responses = await asyncio.gather(*coros, return_exceptions=True)
+        by_ts = _merge_histogram_totals(
+            labels, raw_responses, query.start_time, query.end_time
         )
-
-        seen: set[datetime.datetime] = set()
-        merged: list[LogHistogramBucket] = []
-        for resp in responses:
-            if isinstance(resp, Exception):
-                LOGGER.warning('Logz.io histogram shard failed: %s', resp)
-                continue
-            if not isinstance(resp, dict):
-                continue
-            for bucket in _parse_histogram(resp):
-                if bucket.timestamp in seen:
-                    continue
-                if (
-                    bucket.timestamp >= query.start_time
-                    and bucket.timestamp <= query.end_time
-                ):
-                    seen.add(bucket.timestamp)
-                    merged.append(bucket)
-
-        return sorted(merged, key=lambda b: b.timestamp)
+        _overlay_histogram_levels(labels, raw_responses, by_ts)
+        return sorted(by_ts.values(), key=lambda b: b.timestamp)
 
     async def schema(
         self,
@@ -334,6 +357,62 @@ def _parse_histogram(data: dict[str, object]) -> list[LogHistogramBucket]:
         )
         buckets.append(LogHistogramBucket(timestamp=ts, count=count))
     return buckets
+
+
+def _merge_histogram_totals(
+    labels: list[str | None],
+    responses: list[object],
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+) -> dict[datetime.datetime, LogHistogramBucket]:
+    seen: set[datetime.datetime] = set()
+    by_ts: dict[datetime.datetime, LogHistogramBucket] = {}
+    for label, resp in zip(labels, responses, strict=True):
+        if label is not None:
+            continue
+        if isinstance(resp, Exception):
+            LOGGER.warning('Logz.io histogram shard failed: %s', resp)
+            continue
+        if not isinstance(resp, dict):
+            continue
+        for bucket in _parse_histogram(resp):
+            if bucket.timestamp in seen:
+                continue
+            if start_time <= bucket.timestamp <= end_time:
+                seen.add(bucket.timestamp)
+                by_ts[bucket.timestamp] = bucket
+    return by_ts
+
+
+def _overlay_histogram_levels(
+    labels: list[str | None],
+    responses: list[object],
+    by_ts: dict[datetime.datetime, LogHistogramBucket],
+) -> None:
+    level_seen: dict[str, set[datetime.datetime]] = {}
+    for label, resp in zip(labels, responses, strict=True):
+        if label is None:
+            continue
+        if isinstance(resp, Exception):
+            LOGGER.warning(
+                'Logz.io histogram level=%s shard failed: %s', label, resp
+            )
+            continue
+        if not isinstance(resp, dict):
+            continue
+        seen_for_level = level_seen.setdefault(label, set())
+        for bucket in _parse_histogram(resp):
+            if bucket.timestamp in seen_for_level:
+                continue
+            seen_for_level.add(bucket.timestamp)
+            if bucket.timestamp not in by_ts:
+                continue
+            existing = by_ts[bucket.timestamp]
+            new_levels = dict(existing.levels)
+            new_levels[label] = bucket.count
+            by_ts[bucket.timestamp] = existing.model_copy(
+                update={'levels': new_levels}
+            )
 
 
 def _connection_opts(ctx: PluginContext) -> tuple[str, float]:

@@ -18,6 +18,8 @@ def _build_bool_clause(
     timestamp_field: str,
     message_field: str,
     ctx_vars: dict[str, str | None],
+    environment_field: str | None = None,
+    environment_value: str | None = None,
 ) -> dict[str, object]:
     must: list[dict[str, object]] = [
         {
@@ -30,6 +32,9 @@ def _build_bool_clause(
         }
     ]
     must_not: list[dict[str, object]] = []
+
+    if environment_field and environment_value:
+        must.append({'term': {environment_field: environment_value}})
 
     if base_query:
         expanded = expand_template(base_query, ctx_vars)
@@ -58,6 +63,8 @@ def build_query_body(
     timestamp_field: str,
     message_field: str,
     ctx_vars: dict[str, str | None],
+    environment_field: str | None = None,
+    environment_value: str | None = None,
 ) -> dict[str, object]:
     bool_clause = _build_bool_clause(
         query,
@@ -65,6 +72,8 @@ def build_query_body(
         timestamp_field=timestamp_field,
         message_field=message_field,
         ctx_vars=ctx_vars,
+        environment_field=environment_field,
+        environment_value=environment_value,
     )
     return {
         'query': {'bool': bool_clause},
@@ -82,11 +91,19 @@ def build_histogram_body(
     message_field: str,
     ctx_vars: dict[str, str | None],
     bucket_count: int = 60,
+    level_filter: str | None = None,
+    level_field: str = 'level',
+    environment_field: str | None = None,
+    environment_value: str | None = None,
 ) -> dict[str, object]:
     """Build an ES body that returns a date_histogram aggregation.
 
     ``size: 0`` suppresses hit results so only aggregation data is
     returned, keeping the response small regardless of event volume.
+
+    When ``level_filter`` is provided a term filter is added so only
+    events matching that level are counted, enabling per-level breakdown
+    without nested bucket aggregations (which Logz.io forbids).
     """
     bool_clause = _build_bool_clause(
         query,
@@ -94,7 +111,14 @@ def build_histogram_body(
         timestamp_field=timestamp_field,
         message_field=message_field,
         ctx_vars=ctx_vars,
+        environment_field=environment_field,
+        environment_value=environment_value,
     )
+    if level_filter is not None:
+        must = list(cast('list[dict[str, object]]', bool_clause['must']))
+        must.append({'term': {level_field: level_filter}})
+        bool_clause = dict(bool_clause)
+        bool_clause['must'] = must
     total_seconds = max(
         1,
         int((query.end_time - query.start_time).total_seconds()),
