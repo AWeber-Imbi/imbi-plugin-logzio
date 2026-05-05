@@ -284,8 +284,14 @@ class LogzioPlugin(LogsPlugin):
         # (counting back from today) are searched.  Step by 2 to get
         # non-overlapping windows that together cover the full requested range.
         today = datetime.datetime.now(datetime.UTC).date()
-        end_offset = max(0, (today - query.end_time.date()).days)
-        start_offset = max(0, (today - query.start_time.date()).days)
+        end_offset = max(
+            0,
+            (today - query.end_time.astimezone(datetime.UTC).date()).days,
+        )
+        start_offset = max(
+            0,
+            (today - query.start_time.astimezone(datetime.UTC).date()).days,
+        )
         day_offsets = list(range(end_offset, start_offset + 2, 2))
 
         # Fan out: one total query + one per level per day offset.
@@ -296,14 +302,16 @@ class LogzioPlugin(LogsPlugin):
             body = _body(lvl)
             for offset in day_offsets:
                 labels.append(lvl)
-                coros.append(post_search(
-                    api_token=api_token,
-                    body=body,
-                    day_offset=offset,
-                    region=region,
-                    timeout=timeout,
-                    version=_VERSION,
-                ))
+                coros.append(
+                    post_search(
+                        api_token=api_token,
+                        body=body,
+                        day_offset=offset,
+                        region=region,
+                        timeout=timeout,
+                        version=_VERSION,
+                    )
+                )
 
         raw_responses = await asyncio.gather(*coros, return_exceptions=True)
         by_ts = _merge_histogram_totals(
@@ -365,7 +373,6 @@ def _merge_histogram_totals(
     start_time: datetime.datetime,
     end_time: datetime.datetime,
 ) -> dict[datetime.datetime, LogHistogramBucket]:
-    seen: set[datetime.datetime] = set()
     by_ts: dict[datetime.datetime, LogHistogramBucket] = {}
     for label, resp in zip(labels, responses, strict=True):
         if label is not None:
@@ -376,11 +383,15 @@ def _merge_histogram_totals(
         if not isinstance(resp, dict):
             continue
         for bucket in _parse_histogram(resp):
-            if bucket.timestamp in seen:
+            if not (start_time <= bucket.timestamp <= end_time):
                 continue
-            if start_time <= bucket.timestamp <= end_time:
-                seen.add(bucket.timestamp)
+            existing = by_ts.get(bucket.timestamp)
+            if existing is None:
                 by_ts[bucket.timestamp] = bucket
+            else:
+                by_ts[bucket.timestamp] = existing.model_copy(
+                    update={'count': existing.count + bucket.count}
+                )
     return by_ts
 
 
@@ -389,7 +400,7 @@ def _overlay_histogram_levels(
     responses: list[object],
     by_ts: dict[datetime.datetime, LogHistogramBucket],
 ) -> None:
-    level_seen: dict[str, set[datetime.datetime]] = {}
+    level_counts: dict[str, dict[datetime.datetime, int]] = {}
     for label, resp in zip(labels, responses, strict=True):
         if label is None:
             continue
@@ -400,19 +411,19 @@ def _overlay_histogram_levels(
             continue
         if not isinstance(resp, dict):
             continue
-        seen_for_level = level_seen.setdefault(label, set())
+        counts_for_level = level_counts.setdefault(label, {})
         for bucket in _parse_histogram(resp):
-            if bucket.timestamp in seen_for_level:
-                continue
-            seen_for_level.add(bucket.timestamp)
             if bucket.timestamp not in by_ts:
                 continue
-            existing = by_ts[bucket.timestamp]
-            new_levels = dict(existing.levels)
-            new_levels[label] = bucket.count
-            by_ts[bucket.timestamp] = existing.model_copy(
-                update={'levels': new_levels}
+            counts_for_level[bucket.timestamp] = (
+                counts_for_level.get(bucket.timestamp, 0) + bucket.count
             )
+    for label, counts_for_level in level_counts.items():
+        for ts, count in counts_for_level.items():
+            existing = by_ts[ts]
+            new_levels = dict(existing.levels)
+            new_levels[label] = count
+            by_ts[ts] = existing.model_copy(update={'levels': new_levels})
 
 
 def _connection_opts(ctx: PluginContext) -> tuple[str, float]:

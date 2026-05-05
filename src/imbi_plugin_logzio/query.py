@@ -123,7 +123,7 @@ def build_histogram_body(
         1,
         int((query.end_time - query.start_time).total_seconds()),
     )
-    interval_seconds = max(1, total_seconds // bucket_count)
+    interval_seconds = max(1, -(-total_seconds // bucket_count))
     interval_str = _seconds_to_fixed_interval(interval_seconds)
     return {
         'size': 0,
@@ -148,13 +148,13 @@ def _seconds_to_fixed_interval(seconds: int) -> str:
     """
     if seconds < 60:
         return f'{max(1, seconds)}s'
-    minutes = -(-seconds // 60)   # ceiling division
+    minutes = -(-seconds // 60)  # ceiling division
     if minutes < 60:
         return f'{minutes}m'
-    hours = -(-minutes // 60)     # ceiling division
+    hours = -(-minutes // 60)  # ceiling division
     if hours < 24:
         return f'{hours}h'
-    days = -(-hours // 24)        # ceiling division
+    days = -(-hours // 24)  # ceiling division
     return f'{days}d'
 
 
