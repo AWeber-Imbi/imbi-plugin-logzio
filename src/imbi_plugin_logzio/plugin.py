@@ -3,9 +3,10 @@
 import asyncio
 import datetime
 import logging
+from collections.abc import Coroutine, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from typing import cast
+from typing import Any, cast
 
 from imbi_common.plugins.base import (
     CredentialField,
@@ -297,7 +298,7 @@ class LogzioPlugin(LogsPlugin):
         # Fan out: one total query + one per level per day offset.
         level_names = ['ERROR', 'WARN', 'WARNING', 'INFO', 'DEBUG']
         labels: list[str | None] = []
-        coros = []
+        coros: list[Coroutine[Any, Any, dict[str, object]]] = []
         for lvl in [None, *level_names]:
             body = _body(lvl)
             for offset in day_offsets:
@@ -313,7 +314,9 @@ class LogzioPlugin(LogsPlugin):
                     )
                 )
 
-        raw_responses = await asyncio.gather(*coros, return_exceptions=True)
+        raw_responses: Sequence[object] = await asyncio.gather(
+            *coros, return_exceptions=True
+        )
         by_ts = _merge_histogram_totals(
             labels, raw_responses, query.start_time, query.end_time
         )
@@ -347,19 +350,21 @@ def _parse_histogram(data: dict[str, object]) -> list[LogHistogramBucket]:
     over_time = cast('dict[str, object]', aggs).get('over_time', {})
     if not isinstance(over_time, dict):
         return []
-    raw_buckets = cast('dict[str, object]', over_time).get('buckets', [])
-    if not isinstance(raw_buckets, list):
+    raw_buckets_val = cast('dict[str, object]', over_time).get('buckets', [])
+    if not isinstance(raw_buckets_val, list):
         return []
+    raw_buckets = cast('list[object]', raw_buckets_val)
 
     buckets: list[LogHistogramBucket] = []
-    for raw in raw_buckets:
-        if not isinstance(raw, dict):
+    for raw_item in raw_buckets:
+        if not isinstance(raw_item, dict):
             continue
-        b = cast('dict[str, object]', raw)
+        b = cast('dict[str, object]', raw_item)
         key_ms = b.get('key')
         if not isinstance(key_ms, (int, float)):
             continue
-        count = int(b.get('doc_count', 0))
+        doc_count = b.get('doc_count', 0)
+        count = int(doc_count) if isinstance(doc_count, (int, float)) else 0
         ts = datetime.datetime.fromtimestamp(
             int(key_ms) / 1000, tz=datetime.UTC
         )
@@ -369,7 +374,7 @@ def _parse_histogram(data: dict[str, object]) -> list[LogHistogramBucket]:
 
 def _merge_histogram_totals(
     labels: list[str | None],
-    responses: list[object],
+    responses: Sequence[object],
     start_time: datetime.datetime,
     end_time: datetime.datetime,
 ) -> dict[datetime.datetime, LogHistogramBucket]:
@@ -382,7 +387,8 @@ def _merge_histogram_totals(
             continue
         if not isinstance(resp, dict):
             continue
-        for bucket in _parse_histogram(resp):
+        resp_dict = cast('dict[str, object]', resp)
+        for bucket in _parse_histogram(resp_dict):
             if not (start_time <= bucket.timestamp <= end_time):
                 continue
             existing = by_ts.get(bucket.timestamp)
@@ -397,7 +403,7 @@ def _merge_histogram_totals(
 
 def _overlay_histogram_levels(
     labels: list[str | None],
-    responses: list[object],
+    responses: Sequence[object],
     by_ts: dict[datetime.datetime, LogHistogramBucket],
 ) -> None:
     level_counts: dict[str, dict[datetime.datetime, int]] = {}
@@ -412,7 +418,8 @@ def _overlay_histogram_levels(
         if not isinstance(resp, dict):
             continue
         counts_for_level = level_counts.setdefault(label, {})
-        for bucket in _parse_histogram(resp):
+        resp_dict = cast('dict[str, object]', resp)
+        for bucket in _parse_histogram(resp_dict):
             if bucket.timestamp not in by_ts:
                 continue
             counts_for_level[bucket.timestamp] = (
