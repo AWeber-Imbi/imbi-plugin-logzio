@@ -1,6 +1,8 @@
 """Logz.io LogsPlugin implementation."""
 
+import asyncio
 import datetime
+import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import cast
@@ -8,6 +10,7 @@ from typing import cast
 from imbi_common.plugins.base import (
     CredentialField,
     LogEntry,
+    LogHistogramBucket,
     LogQuery,
     LogResult,
     LogsPlugin,
@@ -19,12 +22,15 @@ from imbi_common.plugins.errors import PluginCredentialsMissing
 
 from imbi_plugin_logzio.client import get_log_types, post_search
 from imbi_plugin_logzio.query import (
+    build_histogram_body,
     build_query_body,
     compute_fp,
     decode_cursor,
     encode_cursor,
 )
 from imbi_plugin_logzio.schema import build_schema
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _get_version() -> str:
@@ -45,6 +51,7 @@ class LogzioPlugin(LogsPlugin):
         plugin_type='logs',
         api_version=1,
         cacheable=False,
+        supports_histogram=True,
         options=[
             PluginOption(
                 name='region',
@@ -204,6 +211,84 @@ class LogzioPlugin(LogsPlugin):
 
         return LogResult(entries=entries, next_cursor=next_cursor, total=total)
 
+    async def histogram(
+        self,
+        ctx: PluginContext,
+        credentials: dict[str, str],
+        query: LogQuery,
+        bucket_count: int = 60,
+    ) -> list[LogHistogramBucket]:
+        api_token = credentials.get('api_token', '')
+        if not api_token:
+            raise PluginCredentialsMissing('api_token is required')
+
+        opts = ctx.assignment_options
+        region, timeout = _connection_opts(ctx)
+        timestamp_field = str(opts.get('timestamp_field', '@timestamp'))
+        message_field = str(opts.get('message_field', 'message'))
+        raw_bq = opts.get('base_query')
+        base_query_template = str(raw_bq) if raw_bq is not None else None
+
+        ctx_vars: dict[str, str | None] = {
+            'environment': ctx.environment,
+            'org_slug': ctx.org_slug,
+            'project_id': ctx.project_id,
+            'project_slug': ctx.project_slug,
+        }
+
+        body = build_histogram_body(
+            query,
+            base_query=base_query_template,
+            bucket_count=bucket_count,
+            ctx_vars=ctx_vars,
+            message_field=message_field,
+            timestamp_field=timestamp_field,
+        )
+
+        # Logz.io /v1/search only searches a 2-calendar-day (UTC) window per
+        # request.  dayOffset=N shifts the window so that day N and day N+1
+        # (counting back from today) are searched.  Step by 2 to get
+        # non-overlapping windows that together cover the full requested range.
+        today = datetime.datetime.now(datetime.UTC).date()
+        end_offset = max(0, (today - query.end_time.date()).days)
+        start_offset = max(0, (today - query.start_time.date()).days)
+        day_offsets = list(range(end_offset, start_offset + 2, 2))
+
+        responses = await asyncio.gather(
+            *[
+                post_search(
+                    api_token=api_token,
+                    body=body,
+                    day_offset=offset,
+                    region=region,
+                    timeout=timeout,
+                    version=_VERSION,
+                )
+                for offset in day_offsets
+            ],
+            return_exceptions=True,
+        )
+
+        seen: set[datetime.datetime] = set()
+        merged: list[LogHistogramBucket] = []
+        for resp in responses:
+            if isinstance(resp, Exception):
+                LOGGER.warning('Logz.io histogram shard failed: %s', resp)
+                continue
+            if not isinstance(resp, dict):
+                continue
+            for bucket in _parse_histogram(resp):
+                if bucket.timestamp in seen:
+                    continue
+                if (
+                    bucket.timestamp >= query.start_time
+                    and bucket.timestamp <= query.end_time
+                ):
+                    seen.add(bucket.timestamp)
+                    merged.append(bucket)
+
+        return sorted(merged, key=lambda b: b.timestamp)
+
     async def schema(
         self,
         ctx: PluginContext,
@@ -222,6 +307,33 @@ class LogzioPlugin(LogsPlugin):
             )
 
         return build_schema(log_types)
+
+
+def _parse_histogram(data: dict[str, object]) -> list[LogHistogramBucket]:
+    aggs = data.get('aggregations', {})
+    if not isinstance(aggs, dict):
+        return []
+    over_time = cast('dict[str, object]', aggs).get('over_time', {})
+    if not isinstance(over_time, dict):
+        return []
+    raw_buckets = cast('dict[str, object]', over_time).get('buckets', [])
+    if not isinstance(raw_buckets, list):
+        return []
+
+    buckets: list[LogHistogramBucket] = []
+    for raw in raw_buckets:
+        if not isinstance(raw, dict):
+            continue
+        b = cast('dict[str, object]', raw)
+        key_ms = b.get('key')
+        if not isinstance(key_ms, (int, float)):
+            continue
+        count = int(b.get('doc_count', 0))
+        ts = datetime.datetime.fromtimestamp(
+            int(key_ms) / 1000, tz=datetime.UTC
+        )
+        buckets.append(LogHistogramBucket(timestamp=ts, count=count))
+    return buckets
 
 
 def _connection_opts(ctx: PluginContext) -> tuple[str, float]:
