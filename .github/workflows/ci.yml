@@ -32,7 +32,9 @@ jobs:
         working-directory: imbi-plugin-logzio
         env:
           UV_CONFIG_FILE: /dev/null
-        run: uv sync
+        run: |
+          uv sync
+          uv pip install --reinstall-package imbi-common ../imbi-common[server,databases]
 
       - name: Lint
         working-directory: imbi-plugin-logzio
