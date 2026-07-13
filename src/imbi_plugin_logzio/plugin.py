@@ -384,6 +384,7 @@ class LogzioPlugin(Plugin):
     manifest = PluginManifest(
         slug='logzio',
         name='Logz.io',
+        icon='tabler-logs',
         description='Search Logz.io logs from the Imbi project logs tab.',
         api_version=2,
         auth_type='api_token',
